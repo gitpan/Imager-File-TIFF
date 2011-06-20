@@ -1,6 +1,6 @@
 #!perl -w
 use strict;
-use Test::More tests => 216;
+use Test::More tests => 217;
 use Imager qw(:all);
 use Imager::Test qw(is_image is_image_similar test_image test_image_16 test_image_double test_image_raw);
 
@@ -309,17 +309,21 @@ for my $i (0..$#imgs) {
 # correctly on read
 @imgs = map $ooim->copy(), 1..40;
 $rc = Imager->write_multi({file=>'testout/t106_multi2.tif'}, @imgs);
-ok($rc, "writing 40 images to tiff");
+ok($rc, "writing 40 images to tiff")
+  or diag("writing 40 images: " . Imager->errstr);
 @out = Imager->read_multi(file=>'testout/t106_multi2.tif');
-ok(@imgs == @out, "reading 40 images from tiff");
+ok(@imgs == @out, "reading 40 images from tiff")
+  or diag("reading 40 images:" . Imager->errstr);
 # force some allocation activity - helps crash here if it's the problem
 @out = @imgs = ();
 
 # multi-image fax files
 ok(Imager->write_multi({file=>'testout/t106_faxmulti.tiff', class=>'fax'},
-		       $oofim, $oofim), "write multi fax image");
+		       $oofim, $oofim), "write multi fax image")
+  or diag("writing 40 fax pages: " . Imager->errstr);
 @imgs = Imager->read_multi(file=>'testout/t106_faxmulti.tiff');
-ok(@imgs == 2, "reading multipage fax");
+ok(@imgs == 2, "reading multipage fax")
+  or diag("reading 40 fax pages: " . Imager->errstr);
 ok(Imager::i_img_diff($imgs[0]{IMG}, $oofim->{IMG}) == 0,
    "compare first fax image");
 ok(Imager::i_img_diff($imgs[1]{IMG}, $oofim->{IMG}) == 0,
@@ -336,8 +340,9 @@ is($unitname, 'inch', "check tiff_resolutionunit_name tag");
 my $warned = Imager->new;
 ok($warned->read(file=>"testimg/tiffwarn.tif"), "read tiffwarn.tif");
 my ($warning) = $warned->tags(name=>'i_warning');
-ok(defined $warning && $warning =~ /unknown field with tag 28712/,
-   "check that warning tag set and correct");
+ok(defined $warning, "check warning is set");
+like($warning, qr/[Uu]nknown field with tag 28712/,
+     "check that warning tag correct");
 
 { # support for reading a given page
   # first build a simple test image
