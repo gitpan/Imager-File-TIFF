@@ -50,8 +50,8 @@ struct tag_name {
   uint32 tag;
 };
 
-static i_img *read_one_rgb_tiled(TIFF *tif, int width, int height, int allow_incomplete);
-static i_img *read_one_rgb_lines(TIFF *tif, int width, int height, int allow_incomplete);
+static i_img *read_one_rgb_tiled(TIFF *tif, i_img_dim width, i_img_dim height, int allow_incomplete);
+static i_img *read_one_rgb_lines(TIFF *tif, i_img_dim width, i_img_dim height, int allow_incomplete);
 
 static struct tag_name text_tag_names[] =
 {
@@ -100,8 +100,8 @@ typedef int (*read_setup_t)(read_state_t *state);
    the raster buffer, (for tiles against the right side of the
    image) */
 
-typedef int (*read_putter_t)(read_state_t *state, int x, int y, int width, 
-			     int height, int extras);
+typedef int (*read_putter_t)(read_state_t *state, i_img_dim x, i_img_dim y,
+			     i_img_dim width, i_img_dim height, int extras);
 
 /* reads from a tiled or strip image and calls the putter.
    This may need a second type for handling non-contiguous images
@@ -112,7 +112,7 @@ struct read_state_tag {
   TIFF *tif;
   i_img *img;
   void *raster;
-  unsigned long pixels_read;
+  i_img_dim pixels_read;
   int allow_incomplete;
   void *line_buf;
   uint32 width, height;
@@ -136,29 +136,37 @@ static int tile_contig_getter(read_state_t *state, read_putter_t putter);
 static int strip_contig_getter(read_state_t *state, read_putter_t putter);
 
 static int setup_paletted(read_state_t *state);
-static int paletted_putter8(read_state_t *, int, int, int, int, int);
-static int paletted_putter4(read_state_t *, int, int, int, int, int);
+static int paletted_putter8(read_state_t *, i_img_dim, i_img_dim, i_img_dim, i_img_dim, int);
+static int paletted_putter4(read_state_t *, i_img_dim, i_img_dim, i_img_dim, i_img_dim, int);
 
 static int setup_16_rgb(read_state_t *state);
 static int setup_16_grey(read_state_t *state);
-static int putter_16(read_state_t *, int, int, int, int, int);
+static int putter_16(read_state_t *, i_img_dim, i_img_dim, i_img_dim, i_img_dim, int);
 
 static int setup_8_rgb(read_state_t *state);
 static int setup_8_grey(read_state_t *state);
-static int putter_8(read_state_t *, int, int, int, int, int);
+static int putter_8(read_state_t *, i_img_dim, i_img_dim, i_img_dim, i_img_dim, int);
 
 static int setup_32_rgb(read_state_t *state);
 static int setup_32_grey(read_state_t *state);
-static int putter_32(read_state_t *, int, int, int, int, int);
+static int putter_32(read_state_t *, i_img_dim, i_img_dim, i_img_dim, i_img_dim, int);
 
 static int setup_bilevel(read_state_t *state);
-static int putter_bilevel(read_state_t *, int, int, int, int, int);
+static int putter_bilevel(read_state_t *, i_img_dim, i_img_dim, i_img_dim, i_img_dim, int);
 
 static int setup_cmyk8(read_state_t *state);
-static int putter_cmyk8(read_state_t *, int, int, int, int, int);
+static int putter_cmyk8(read_state_t *, i_img_dim, i_img_dim, i_img_dim, i_img_dim, int);
 
 static int setup_cmyk16(read_state_t *state);
-static int putter_cmyk16(read_state_t *, int, int, int, int, int);
+static int putter_cmyk16(read_state_t *, i_img_dim, i_img_dim, i_img_dim, i_img_dim, int);
+static void
+rgb_channels(read_state_t *state, int *out_channels);
+static void
+grey_channels(read_state_t *state, int *out_channels);
+static void
+cmyk_channels(read_state_t *state, int *out_channels);
+static void
+fallback_rgb_channels(TIFF *tif, i_img_dim width, i_img_dim height, int *channels, int *alpha_chan);
 
 static const int text_tag_count = 
   sizeof(text_tag_names) / sizeof(*text_tag_names);
@@ -176,7 +184,7 @@ static void warn_handler(char const *module, char const *fmt, va_list ap) {
   char buf[1000];
 
   buf[0] = '\0';
-#ifdef HAVE_SNPRINTF
+#ifdef IMAGER_VSNPRINTF
   vsnprintf(buf, sizeof(buf), fmt, ap);
 #else
   vsprintf(buf, fmt, ap);
@@ -202,7 +210,7 @@ static void warn_handler(char const *module, char const *fmt, va_list ap) {
 static int save_tiff_tags(TIFF *tif, i_img *im);
 
 static void 
-pack_4bit_to(unsigned char *dest, const unsigned char *src, int count);
+pack_4bit_to(unsigned char *dest, const unsigned char *src, i_img_dim count);
 
 
 static toff_t sizeproc(thandle_t x) {
@@ -278,6 +286,9 @@ static i_img *read_one_tiff(TIFF *tif, int allow_incomplete) {
   read_setup_t setupf = NULL;
   read_getter_t getterf = NULL;
   read_putter_t putterf = NULL;
+  int channels = MAXCHANNELS;
+  size_t sample_size = ~0; /* force failure if some code doesn't set it */
+  i_img_dim total_pixels;
 
   error = 0;
 
@@ -294,6 +305,16 @@ static i_img *read_one_tiff(TIFF *tif, int allow_incomplete) {
   mm_log((1, "i_readtiff_wiol: %stiled\n", tiled?"":"not "));
   mm_log((1, "i_readtiff_wiol: %sbyte swapped\n", TIFFIsByteSwapped(tif)?"":"not "));
 
+  total_pixels = width * height;
+  memset(&state, 0, sizeof(state));
+  state.tif = tif;
+  state.allow_incomplete = allow_incomplete;
+  state.width = width;
+  state.height = height;
+  state.bits_per_sample = bits_per_sample;
+  state.samples_per_pixel = samples_per_pixel;
+  state.photometric = photometric;
+
   /* yes, this if() is horrible */
   if (photometric == PHOTOMETRIC_PALETTE && bits_per_sample <= 8) {
     setupf = setup_paletted;
@@ -303,38 +324,53 @@ static i_img *read_one_tiff(TIFF *tif, int allow_incomplete) {
       putterf = paletted_putter4;
     else
       mm_log((1, "unsupported paletted bits_per_sample %d\n", bits_per_sample));
+
+    sample_size = sizeof(i_sample_t);
+    channels = 1;
   }
   else if (bits_per_sample == 16 
 	   && photometric == PHOTOMETRIC_RGB
 	   && samples_per_pixel >= 3) {
     setupf = setup_16_rgb;
     putterf = putter_16;
+    sample_size = 2;
+    rgb_channels(&state, &channels);
   }
   else if (bits_per_sample == 16
 	   && photometric == PHOTOMETRIC_MINISBLACK) {
     setupf = setup_16_grey;
     putterf = putter_16;
+    sample_size = 2;
+    grey_channels(&state, &channels);
   }
   else if (bits_per_sample == 8
 	   && photometric == PHOTOMETRIC_MINISBLACK) {
     setupf = setup_8_grey;
     putterf = putter_8;
+    sample_size = 1;
+    grey_channels(&state, &channels);
   }
   else if (bits_per_sample == 8
 	   && photometric == PHOTOMETRIC_RGB) {
     setupf = setup_8_rgb;
     putterf = putter_8;
+    sample_size = 1;
+    rgb_channels(&state, &channels);
   }
   else if (bits_per_sample == 32 
 	   && photometric == PHOTOMETRIC_RGB
 	   && samples_per_pixel >= 3) {
     setupf = setup_32_rgb;
     putterf = putter_32;
+    sample_size = sizeof(i_fsample_t);
+    rgb_channels(&state, &channels);
   }
   else if (bits_per_sample == 32
 	   && photometric == PHOTOMETRIC_MINISBLACK) {
     setupf = setup_32_grey;
     putterf = putter_32;
+    sample_size = sizeof(i_fsample_t);
+    grey_channels(&state, &channels);
   }
   else if (bits_per_sample == 1
 	   && (photometric == PHOTOMETRIC_MINISBLACK
@@ -342,6 +378,8 @@ static i_img *read_one_tiff(TIFF *tif, int allow_incomplete) {
 	   && samples_per_pixel == 1) {
     setupf = setup_bilevel;
     putterf = putter_bilevel;
+    sample_size = sizeof(i_palidx);
+    channels = 1;
   }
   else if (bits_per_sample == 8
 	   && photometric == PHOTOMETRIC_SEPARATED
@@ -349,6 +387,8 @@ static i_img *read_one_tiff(TIFF *tif, int allow_incomplete) {
 	   && samples_per_pixel >= 4) {
     setupf = setup_cmyk8;
     putterf = putter_cmyk8;
+    sample_size = 1;
+    cmyk_channels(&state, &channels);
   }
   else if (bits_per_sample == 16
 	   && photometric == PHOTOMETRIC_SEPARATED
@@ -356,7 +396,19 @@ static i_img *read_one_tiff(TIFF *tif, int allow_incomplete) {
 	   && samples_per_pixel >= 4) {
     setupf = setup_cmyk16;
     putterf = putter_cmyk16;
+    sample_size = 2;
+    cmyk_channels(&state, &channels);
   }
+  else {
+    int alpha;
+    fallback_rgb_channels(tif, width, height, &channels, &alpha);
+    sample_size = 1;
+  }
+
+  if (!i_int_check_image_file_limits(width, height, channels, sample_size)) {
+    return NULL;
+  }
+
   if (tiled) {
     if (planar_config == PLANARCONFIG_CONTIG)
       getterf = tile_contig_getter;
@@ -366,15 +418,6 @@ static i_img *read_one_tiff(TIFF *tif, int allow_incomplete) {
       getterf = strip_contig_getter;
   }
   if (setupf && getterf && putterf) {
-    unsigned long total_pixels = (unsigned long)width * height;
-    memset(&state, 0, sizeof(state));
-    state.tif = tif;
-    state.allow_incomplete = allow_incomplete;
-    state.width = width;
-    state.height = height;
-    state.bits_per_sample = bits_per_sample;
-    state.samples_per_pixel = samples_per_pixel;
-    state.photometric = photometric;
 
     if (!setupf(&state))
       return NULL;
@@ -488,6 +531,7 @@ i_readtiff_wiol(io_glue *ig, int allow_incomplete, int page) {
   TIFFErrorHandler old_handler;
   TIFFErrorHandler old_warn_handler;
   i_img *im;
+  int current_page;
 
   i_clear_error();
   old_handler = TIFFSetErrorHandler(error_handler);
@@ -519,8 +563,8 @@ i_readtiff_wiol(io_glue *ig, int allow_incomplete, int page) {
     return NULL;
   }
 
-  if (page != 0) {
-    if (!TIFFSetDirectory(tif, page)) {
+  for (current_page = 0; current_page < page; ++current_page) {
+    if (!TIFFReadDirectory(tif)) {
       mm_log((1, "i_readtiff_wiol: Unable to switch to directory %d\n", page));
       i_push_errorf(0, "could not switch to page %d", page);
       TIFFSetErrorHandler(old_handler);
@@ -607,7 +651,7 @@ i_readtiff_multi_wiol(io_glue *ig, int *count) {
       }
     }
     results[*count-1] = im;
-  } while (TIFFSetDirectory(tif, ++dirnum));
+  } while (TIFFReadDirectory(tif));
 
   TIFFSetWarningHandler(old_warn_handler);
   TIFFSetErrorHandler(old_handler);
@@ -628,6 +672,11 @@ i_writetiff_low_faxable(TIFF *tif, i_img *im, int fine) {
 
   width    = im->xsize;
   height   = im->ysize;
+
+  if (width != im->xsize || height != im->ysize) {
+    i_push_error(0, "image too large for TIFF");
+    return 0;
+  }
 
   switch (im->channels) {
   case 1:
@@ -851,7 +900,7 @@ write_one_bilevel(TIFF *tif, i_img *im, int zero_is_white) {
   unsigned char *in_row;
   unsigned char *out_row;
   unsigned out_size;
-  int x, y;
+  i_img_dim x, y;
   int invert;
 
   mm_log((1, "tiff - write_one_bilevel(tif %p, im %p, zero_is_white %d)\n", 
@@ -956,7 +1005,7 @@ write_one_paletted8(TIFF *tif, i_img *im) {
   uint16 compress = get_compression(im, COMPRESSION_PACKBITS);
   unsigned char *out_row;
   unsigned out_size;
-  int y;
+  i_img_dim y;
 
   mm_log((1, "tiff - write_one_paletted8(tif %p, im %p)\n", tif, im));
 
@@ -1000,8 +1049,8 @@ write_one_paletted4(TIFF *tif, i_img *im) {
   uint16 compress = get_compression(im, COMPRESSION_PACKBITS);
   unsigned char *in_row;
   unsigned char *out_row;
-  unsigned out_size;
-  int y;
+  size_t out_size;
+  i_img_dim y;
 
   mm_log((1, "tiff - write_one_paletted4(tif %p, im %p)\n", tif, im));
 
@@ -1084,7 +1133,7 @@ write_one_32(TIFF *tif, i_img *im) {
   unsigned *in_row;
   size_t out_size;
   uint32 *out_row;
-  int y;
+  i_img_dim y;
   size_t sample_count = im->xsize * im->channels;
   size_t sample_index;
     
@@ -1128,7 +1177,7 @@ write_one_16(TIFF *tif, i_img *im) {
   unsigned *in_row;
   size_t out_size;
   uint16 *out_row;
-  int y;
+  i_img_dim y;
   size_t sample_count = im->xsize * im->channels;
   size_t sample_index;
     
@@ -1171,7 +1220,7 @@ write_one_8(TIFF *tif, i_img *im) {
   uint16 compress = get_compression(im, COMPRESSION_PACKBITS);
   size_t out_size;
   unsigned char *out_row;
-  int y;
+  i_img_dim y;
   size_t sample_count = im->xsize * im->channels;
     
   mm_log((1, "tiff - write_one_8(tif %p, im %p)\n", tif, im));
@@ -1209,6 +1258,11 @@ i_writetiff_low(TIFF *tif, i_img *im) {
   width    = im->xsize;
   height   = im->ysize;
   channels = im->channels;
+
+  if (width != im->xsize || height != im->ysize) {
+    i_push_error(0, "image too large for TIFF");
+    return 0;
+  }
 
   mm_log((1, "i_writetiff_low: width=%d, height=%d, channels=%d, bits=%d\n", width, height, channels, im->bits));
   if (im->type == i_palette_type) {
@@ -1268,7 +1322,7 @@ i_writetiff_multi_wiol(io_glue *ig, i_img **imgs, int count) {
   old_handler = TIFFSetErrorHandler(error_handler);
 
   i_clear_error();
-  mm_log((1, "i_writetiff_multi_wiol(ig 0x%p, imgs 0x%p, count %d)\n", 
+  mm_log((1, "i_writetiff_multi_wiol(ig %p, imgs %p, count %d)\n", 
           ig, imgs, count));
 
   /* FIXME: Enable the mmap interface */
@@ -1336,7 +1390,7 @@ i_writetiff_multi_wiol_faxable(io_glue *ig, i_img **imgs, int count, int fine) {
   old_handler = TIFFSetErrorHandler(error_handler);
 
   i_clear_error();
-  mm_log((1, "i_writetiff_multi_wiol(ig 0x%p, imgs 0x%p, count %d)\n", 
+  mm_log((1, "i_writetiff_multi_wiol(ig %p, imgs %p, count %d)\n", 
           ig, imgs, count));
 
   /* FIXME: Enable the mmap interface */
@@ -1400,7 +1454,7 @@ i_writetiff_wiol(i_img *img, io_glue *ig) {
   old_handler = TIFFSetErrorHandler(error_handler);
 
   i_clear_error();
-  mm_log((1, "i_writetiff_wiol(img %p, ig 0x%p)\n", img, ig));
+  mm_log((1, "i_writetiff_wiol(img %p, ig %p)\n", img, ig));
 
   /* FIXME: Enable the mmap interface */
 
@@ -1461,7 +1515,7 @@ i_writetiff_wiol_faxable(i_img *im, io_glue *ig, int fine) {
   old_handler = TIFFSetErrorHandler(error_handler);
 
   i_clear_error();
-  mm_log((1, "i_writetiff_wiol(img %p, ig 0x%p)\n", im, ig));
+  mm_log((1, "i_writetiff_wiol(img %p, ig %p)\n", im, ig));
 
   /* FIXME: Enable the mmap interface */
   
@@ -1517,7 +1571,7 @@ static int save_tiff_tags(TIFF *tif, i_img *im) {
 
 static void
 unpack_4bit_to(unsigned char *dest, const unsigned char *src, 
-	       int src_byte_count) {
+	       size_t src_byte_count) {
   while (src_byte_count > 0) {
     *dest++ = *src >> 4;
     *dest++ = *src++ & 0xf;
@@ -1526,7 +1580,7 @@ unpack_4bit_to(unsigned char *dest, const unsigned char *src,
 }
 
 static void pack_4bit_to(unsigned char *dest, const unsigned char *src, 
-			 int pixel_count) {
+			 i_img_dim pixel_count) {
   int i = 0;
   while (i < pixel_count) {
     if ((i & 1) == 0) {
@@ -1539,10 +1593,19 @@ static void pack_4bit_to(unsigned char *dest, const unsigned char *src,
   }
 }
 
-static i_img *
-make_rgb(TIFF *tif, int width, int height, int *alpha_chan) {
+/*
+=item fallback_rgb_channels
+
+Calculate the number of output channels when we fallback to the RGBA
+family of functions.
+
+=cut
+*/
+
+static void
+fallback_rgb_channels(TIFF *tif, i_img_dim width, i_img_dim height, int *channels, int *alpha_chan) {
   uint16 photometric;
-  uint16 channels, in_channels;
+  uint16 in_channels;
   uint16 extra_count;
   uint16 *extras;
 
@@ -1551,7 +1614,7 @@ make_rgb(TIFF *tif, int width, int height, int *alpha_chan) {
 
   switch (photometric) {
   case PHOTOMETRIC_SEPARATED:
-    channels = 3;
+    *channels = 3;
     break;
   
   case PHOTOMETRIC_MINISWHITE:
@@ -1559,11 +1622,11 @@ make_rgb(TIFF *tif, int width, int height, int *alpha_chan) {
     /* the TIFF RGBA functions expand single channel grey into RGB,
        so reduce it, we move the alpha channel into the right place 
        if needed */
-    channels = 1;
+    *channels = 1;
     break;
 
   default:
-    channels = 3;
+    *channels = 3;
     break;
   }
   /* TIFF images can have more than one alpha channel, but Imager can't
@@ -1572,14 +1635,21 @@ make_rgb(TIFF *tif, int width, int height, int *alpha_chan) {
   *alpha_chan = 0;
   if (TIFFGetField(tif, TIFFTAG_EXTRASAMPLES, &extra_count, &extras)
       && extra_count) {
-    *alpha_chan = channels++;
+    *alpha_chan = (*channels)++;
   }
+}
+
+static i_img *
+make_rgb(TIFF *tif, i_img_dim width, i_img_dim height, int *alpha_chan) {
+  int channels = 0;
+
+  fallback_rgb_channels(tif, width, height, &channels, alpha_chan);
 
   return i_img_8_new(width, height, channels);
 }
 
 static i_img *
-read_one_rgb_lines(TIFF *tif, int width, int height, int allow_incomplete) {
+read_one_rgb_lines(TIFF *tif, i_img_dim width, i_img_dim height, int allow_incomplete) {
   i_img *im;
   uint32* raster = NULL;
   uint32 rowsperstrip, row;
@@ -1750,7 +1820,7 @@ myTIFFReadRGBATile(TIFFRGBAImage *img, uint32 col, uint32 row, uint32 * raster)
 }
 
 static i_img *
-read_one_rgb_tiled(TIFF *tif, int width, int height, int allow_incomplete) {
+read_one_rgb_tiled(TIFF *tif, i_img_dim width, i_img_dim height, int allow_incomplete) {
   i_img *im;
   uint32* raster = NULL;
   int ok = 1;
@@ -1968,10 +2038,10 @@ strip_contig_getter(read_state_t *state, read_putter_t putter) {
 }
 
 static int 
-paletted_putter8(read_state_t *state, int x, int y, int width, int height, int extras) {
+paletted_putter8(read_state_t *state, i_img_dim x, i_img_dim y, i_img_dim width, i_img_dim height, int extras) {
   unsigned char *p = state->raster;
 
-  state->pixels_read += (unsigned long) width * height;
+  state->pixels_read += width * height;
   while (height > 0) {
     i_ppal(state->img, x, x + width, y, p);
     p += width + extras;
@@ -1983,7 +2053,7 @@ paletted_putter8(read_state_t *state, int x, int y, int width, int height, int e
 }
 
 static int 
-paletted_putter4(read_state_t *state, int x, int y, int width, int height, int extras) {
+paletted_putter4(read_state_t *state, i_img_dim x, i_img_dim y, i_img_dim width, i_img_dim height, int extras) {
   uint32 img_line_size = (width + 1) / 2;
   uint32 skip_line_size = (width + extras + 1) / 2;
   unsigned char *p = state->raster;
@@ -1991,7 +2061,7 @@ paletted_putter4(read_state_t *state, int x, int y, int width, int height, int e
   if (!state->line_buf)
     state->line_buf = mymalloc(state->width);
 
-  state->pixels_read += (unsigned long) width * height;
+  state->pixels_read += width * height;
   while (height > 0) {
     unpack_4bit_to(state->line_buf, p, img_line_size);
     i_ppal(state->img, x, x + width, y, state->line_buf);
@@ -2121,14 +2191,14 @@ setup_16_grey(read_state_t *state) {
 }
 
 static int 
-putter_16(read_state_t *state, int x, int y, int width, int height, 
+putter_16(read_state_t *state, i_img_dim x, i_img_dim y, i_img_dim width, i_img_dim height, 
 	  int row_extras) {
   uint16 *p = state->raster;
   int out_chan = state->img->channels;
 
-  state->pixels_read += (unsigned long) width * height;
+  state->pixels_read += width * height;
   while (height > 0) {
-    int i;
+    i_img_dim i;
     int ch;
     unsigned *outp = state->line_buf;
 
@@ -2185,14 +2255,14 @@ setup_8_grey(read_state_t *state) {
 }
 
 static int 
-putter_8(read_state_t *state, int x, int y, int width, int height, 
+putter_8(read_state_t *state, i_img_dim x, i_img_dim y, i_img_dim width, i_img_dim height, 
 	  int row_extras) {
   unsigned char *p = state->raster;
   int out_chan = state->img->channels;
 
-  state->pixels_read += (unsigned long) width * height;
+  state->pixels_read += width * height;
   while (height > 0) {
-    int i;
+    i_img_dim i;
     int ch;
     i_color *outp = state->line_buf;
 
@@ -2251,14 +2321,14 @@ setup_32_grey(read_state_t *state) {
 }
 
 static int 
-putter_32(read_state_t *state, int x, int y, int width, int height, 
+putter_32(read_state_t *state, i_img_dim x, i_img_dim y, i_img_dim width, i_img_dim height, 
 	  int row_extras) {
   uint32 *p = state->raster;
   int out_chan = state->img->channels;
 
-  state->pixels_read += (unsigned long) width * height;
+  state->pixels_read += width * height;
   while (height > 0) {
-    int i;
+    i_img_dim i;
     int ch;
     i_fcolor *outp = state->line_buf;
 
@@ -2308,16 +2378,16 @@ setup_bilevel(read_state_t *state) {
 }
 
 static int 
-putter_bilevel(read_state_t *state, int x, int y, int width, int height, 
+putter_bilevel(read_state_t *state, i_img_dim x, i_img_dim y, i_img_dim width, i_img_dim height, 
 	       int row_extras) {
   unsigned char *line_in = state->raster;
   size_t line_size = (width + row_extras + 7) / 8;
   
   /* tifflib returns the bits in MSB2LSB order even when the file is
      in LSB2MSB, so we only need to handle MSB2LSB */
-  state->pixels_read += (unsigned long) width * height;
+  state->pixels_read += width * height;
   while (height > 0) {
-    int i;
+    i_img_dim i;
     unsigned char *outp = state->line_buf;
     unsigned char *inp = line_in;
     unsigned mask = 0x80;
@@ -2398,13 +2468,13 @@ setup_cmyk8(read_state_t *state) {
 }
 
 static int 
-putter_cmyk8(read_state_t *state, int x, int y, int width, int height, 
+putter_cmyk8(read_state_t *state, i_img_dim x, i_img_dim y, i_img_dim width, i_img_dim height, 
 	       int row_extras) {
   unsigned char *p = state->raster;
 
-  state->pixels_read += (unsigned long) width * height;
+  state->pixels_read += width * height;
   while (height > 0) {
-    int i;
+    i_img_dim i;
     int ch;
     i_color *outp = state->line_buf;
 
@@ -2454,16 +2524,16 @@ setup_cmyk16(read_state_t *state) {
 }
 
 static int 
-putter_cmyk16(read_state_t *state, int x, int y, int width, int height, 
+putter_cmyk16(read_state_t *state, i_img_dim x, i_img_dim y, i_img_dim width, i_img_dim height, 
 	       int row_extras) {
   uint16 *p = state->raster;
   int out_chan = state->img->channels;
 
   mm_log((4, "putter_cmyk16(%p, %d, %d, %d, %d, %d)\n", x, y, width, height, row_extras));
 
-  state->pixels_read += (unsigned long) width * height;
+  state->pixels_read += width * height;
   while (height > 0) {
-    int i;
+    i_img_dim i;
     int ch;
     unsigned *outp = state->line_buf;
 
